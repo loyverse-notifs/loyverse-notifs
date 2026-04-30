@@ -3,8 +3,8 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-// PASTE YOUR DISCORD WEBHOOK URL BETWEEN THE QUOTES BELOW
-const DISCORD_WEBHOOK_URL = https://discord.com/api/webhooks/1499385400823644180/iYnVSKX-7QnlqrL-_SiBobfNcOGhOhzgObiIOpiNFQA90_ueNNIzHzqk0fpBhzAQGtOs;
+// Your specific Discord Webhook URL
+const DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1499385400823644180/iYnVSKX-7QnlqrL-_SiBobfNcOGhOhzgObiIOpiNFQA90_ueNNIzHzqk0fpBhzAQGtOs';
 
 app.post('/webhook', async (req, res) => {
     const data = req.body;
@@ -27,5 +27,5 @@ app.post('/webhook', async (req, res) => {
     res.status(200).send('OK');
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Active on port ${PORT}`));
