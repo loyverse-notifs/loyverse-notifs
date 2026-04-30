@@ -9,35 +9,42 @@ const LOYVERSE_TOKEN = process.env.LOYVERSE_ACCESS_TOKEN;
 app.post('/webhook', async (req, res) => {
     const event = req.body;
     console.log("Event Received:", JSON.stringify(event));
-    res.status(200).send('OK'); 
-
-    // This part finds the ID even if Loyverse moves it around
-    const adjustmentId = event.entity_id || event.id;
-
-    if (!adjustmentId) {
-        console.log("No ID found in this event.");
-        return;
-    }
+    res.status(200).send('OK');
 
     try {
-        const response = await axios.get(`https://api.loyverse.com/v1.0/inventory/adjustments/${adjustmentId}`, {
-            headers: { 'Authorization': `Bearer ${LOYVERSE_TOKEN}` }
-        });
+        // Handle "Inventory Level Update" (What shows in your logs)
+        if (event.type === 'inventory_levels.update' && event.inventory_levels) {
+            for (const inv of event.inventory_levels) {
+                // Fetch the item name using the variant_id
+                const itemRes = await axios.get(`https://api.loyverse.com/v1.0/variants/${inv.variant_id}`, {
+                    headers: { 'Authorization': `Bearer ${LOYVERSE_TOKEN}` }
+                });
+                
+                const itemName = itemRes.data.variant_name || itemRes.data.item_name;
 
-        const details = response.data;
-        const item = details.stores[0]?.line_items[0]; 
-        
-        const message = {
-            content: `🚨 **Stock Adjustment Detected** 🚨\n` +
-                     `📦 **Item:** ${item ? item.variant_name : 'Unknown Item'}\n` +
-                     `🔢 **Change:** ${item ? item.stock_delta : '0'}\n` +
-                     `👤 **Reason:** ${details.reason || 'Not specified'}`
-        };
-
-        await axios.post(DISCORD_WEBHOOK_URL, message);
-
+                await axios.post(DISCORD_WEBHOOK_URL, {
+                    content: `📦 **Stock Level Updated**\n` +
+                             `🔹 **Item:** ${itemName}\n` +
+                             `📈 **Current Stock:** ${inv.in_stock}`
+                });
+            }
+        } 
+        // Handle "Stock Adjustment"
+        else if (event.entity_id || event.id) {
+            const adjId = event.entity_id || event.id;
+            const response = await axios.get(`https://api.loyverse.com/v1.0/inventory/adjustments/${adjId}`, {
+                headers: { 'Authorization': `Bearer ${LOYVERSE_TOKEN}` }
+            });
+            const item = response.data.stores[0]?.line_items[0];
+            
+            await axios.post(DISCORD_WEBHOOK_URL, {
+                content: `🚨 **Adjustment Detected**\n` +
+                         `📦 **Item:** ${item ? item.variant_name : 'Unknown'}\n` +
+                         `🔢 **Change:** ${item ? item.stock_delta : '0'}`
+            });
+        }
     } catch (error) {
-        console.error("Error fetching details:", error.response ? JSON.stringify(error.response.data) : error.message);
+        console.error("Error details:", error.response ? JSON.stringify(error.response.data) : error.message);
     }
 });
 
