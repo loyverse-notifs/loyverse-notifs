@@ -11,42 +11,46 @@ app.post('/webhook', async (req, res) => {
     res.status(200).send('OK');
 
     try {
-        if (event.type === 'inventory_levels.update' && event.inventory_levels) {
-            for (const inv of event.inventory_levels) {
-                // 1. Fetch exact product/variant name
-                const itemRes = await axios.get(`https://api.loyverse.com/v1.0/variants/${inv.variant_id}`, {
-                    headers: { 'Authorization': `Bearer ${LOYVERSE_TOKEN}` }
-                });
-                
-                const itemName = itemRes.data.variant_name || itemRes.data.item_name || "Unknown Product";
-                
-                // 2. Calculate the change (Loyverse sends 'in_stock' as the NEW total)
-                // Note: To show "From X to Y", we show the final state detected.
-                const newStock = inv.in_stock;
-
-                await axios.post(DISCORD_WEBHOOK_URL, {
-                    content: `📝 **Stock Change Recorded**\n` +
-                             `👤 **User:** System/Admin\n` +
-                             `📦 **Product:** ${itemName}\n` +
-                             `📊 **Stock Update:** Final level is now **${newStock}**`
-                });
-            }
-        } 
-        else if (event.entity_id) {
-            // Handle formal Adjustments (these usually have User info)
-            const adjRes = await axios.get(`https://api.loyverse.com/v1.0/inventory/adjustments/${event.entity_id}`, {
+        // Handle Stock Adjustments (Best for showing Former vs Result)
+        if (event.entity_id || event.id) {
+            const adjId = event.entity_id || event.id;
+            const adjRes = await axios.get(`https://api.loyverse.com/v1.0/inventory/adjustments/${adjId}`, {
                 headers: { 'Authorization': `Bearer ${LOYVERSE_TOKEN}` }
             });
             
             const data = adjRes.data;
             const item = data.stores[0]?.line_items[0];
             
-            await axios.post(DISCORD_WEBHOOK_URL, {
-                content: `🚨 **Manual Adjustment**\n` +
-                         `👤 **User:** ${data.employee_name || 'Admin'}\n` +
-                         `📦 **Product:** ${item ? item.variant_name : 'Unknown'}\n` +
-                         `📉 **Change:** Adjusted by ${item ? item.stock_delta : '0'}`
-            });
+            if (item) {
+                const change = parseFloat(item.stock_delta);
+                const result = parseFloat(item.post_stock_level);
+                const former = result - change;
+
+                await axios.post(DISCORD_WEBHOOK_URL, {
+                    content: `✅ **Stock Update Success**\n` +
+                             `👤 **User:** ${data.employee_name || 'Admin'}\n` +
+                             `📦 **Product:** ${item.variant_name || item.item_name}\n` +
+                             `🔢 **Former Stock:** ${former}\n` +
+                             `🔄 **Change:** ${change > 0 ? '+' + change : change}\n` +
+                             `🏁 **Resulting Stock:** ${result}`
+                });
+            }
+        } 
+        // Handle Simple Level Updates
+        else if (event.type === 'inventory_levels.update' && event.inventory_levels) {
+            for (const inv of event.inventory_levels) {
+                const itemRes = await axios.get(`https://api.loyverse.com/v1.0/variants/${inv.variant_id}`, {
+                    headers: { 'Authorization': `Bearer ${LOYVERSE_TOKEN}` }
+                });
+                
+                const itemName = itemRes.data.variant_name || itemRes.data.item_name;
+
+                await axios.post(DISCORD_WEBHOOK_URL, {
+                    content: `📦 **Quick Stock Update**\n` +
+                             `🔹 **Product:** ${itemName}\n` +
+                             `🏁 **New Total:** ${inv.in_stock}`
+                });
+            }
         }
     } catch (error) {
         console.error("Error:", error.message);
