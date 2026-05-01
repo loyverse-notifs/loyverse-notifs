@@ -19,7 +19,9 @@ const {
 
   RECENT_ADJUSTMENT_TTL_MS = 90000,
   RECENT_SALE_TTL_MS = 90000,
-  EVENT_DEDUPE_TTL_MS = 10 * 60 * 1000
+  EVENT_DEDUPE_TTL_MS = 10 * 60 * 1000,
+
+  EMPLOYEE_CACHE_TTL_MS = 10 * 60 * 1000
 } = process.env;
 
 if (!DISCORD_WEBHOOK_URL) throw new Error('Missing DISCORD_WEBHOOK_URL');
@@ -30,6 +32,7 @@ const SNAPSHOT_FILE = path.join(__dirname, 'stock-snapshots.json');
 const variantNameCache = new Map();
 const storeNameCache = new Map();
 const stockSnapshots = new Map();
+const employeeCache = new Map();
 
 /**
  * Recent stock adjustments keyed by `${storeId}:${variantId}`
@@ -51,6 +54,9 @@ const pendingInventoryJobs = new Map();
  * Deduped webhook fingerprints
  */
 const processedEvents = new Map();
+
+let employeesLoadedAt = 0;
+let saveTimer = null;
 
 const loyverse = axios.create({
   baseURL: 'https://api.loyverse.com/v1.0',
@@ -202,8 +208,6 @@ async function loadSnapshots() {
   }
 }
 
-let saveTimer = null;
-
 function scheduleSnapshotSave() {
   clearTimeout(saveTimer);
 
@@ -304,6 +308,108 @@ function getAdjustmentId(event) {
 
 function getReceiptId(event) {
   return event?.entity_id || event?.receipt_id || event?.id || null;
+}
+
+async function loadEmployees(force = false) {
+  const now = Date.now();
+
+  if (
+    !force &&
+    employeeCache.size > 0 &&
+    (now - employeesLoadedAt) < Number(EMPLOYEE_CACHE_TTL_MS)
+  ) {
+    return;
+  }
+
+  const fresh = new Map();
+  let cursor = null;
+  let pageCount = 0;
+
+  do {
+    const url = cursor
+      ? `/employees?cursor=${encodeURIComponent(cursor)}`
+      : '/employees';
+
+    const { data } = await loyverseGet(url);
+    const employees = Array.isArray(data.employees) ? data.employees : [];
+
+    for (const emp of employees) {
+      if (!emp?.id) continue;
+
+      fresh.set(emp.id, {
+        id: emp.id,
+        name: emp.name || null,
+        email: emp.email || null,
+        phone_number: emp.phone_number || null,
+        stores: Array.isArray(emp.stores) ? emp.stores : [],
+        is_owner: Boolean(emp.is_owner),
+        deleted_at: emp.deleted_at || null
+      });
+    }
+
+    cursor = data.cursor || null;
+    pageCount += 1;
+
+    // safety guard in case of a bad cursor loop
+    if (pageCount > 1000) {
+      throw new Error('Employees pagination exceeded safe page limit');
+    }
+  } while (cursor);
+
+  employeeCache.clear();
+  for (const [id, emp] of fresh.entries()) {
+    employeeCache.set(id, emp);
+  }
+
+  employeesLoadedAt = now;
+  console.log(`Loaded ${employeeCache.size} employees`);
+}
+
+async function getEmployeeById(employeeId) {
+  if (!employeeId) return null;
+
+  if (!employeeCache.has(employeeId)) {
+    await loadEmployees();
+  }
+
+  if (employeeCache.has(employeeId)) {
+    return employeeCache.get(employeeId);
+  }
+
+  await loadEmployees(true);
+  return employeeCache.get(employeeId) || null;
+}
+
+async function resolveEmployeeName({
+  employeeId,
+  fallbackName,
+  fallbackEmail
+}) {
+  if (employeeId) {
+    const employee = await getEmployeeById(employeeId);
+    if (employee?.name) return employee.name;
+    if (employee?.email) return employee.email;
+  }
+
+  if (fallbackName && String(fallbackName).trim()) {
+    return String(fallbackName).trim();
+  }
+
+  if (fallbackEmail && String(fallbackEmail).trim()) {
+    return String(fallbackEmail).trim();
+  }
+
+  return 'Unknown';
+}
+
+function formatActor(name, employeeId) {
+  const cleanName = String(name || '').trim();
+  const cleanId = String(employeeId || '').trim();
+
+  if (cleanName && cleanId) return `${cleanName}\n\`${cleanId}\``;
+  if (cleanName) return cleanName;
+  if (cleanId) return `Unknown\n\`${cleanId}\``;
+  return 'Unknown';
 }
 
 function registerRecentAdjustment(match) {
@@ -511,11 +617,20 @@ async function handleAdjustmentEvent(event) {
 
   const { data } = await loyverseGet(`/inventory/adjustments/${adjustmentId}`);
 
-  const employeeName =
-    data.employee_name ||
-    data.employee?.name ||
-    data.created_by_name ||
-    'Unknown';
+  const adjustmentEmployeeId =
+    data.employee_id ||
+    data.created_by_employee_id ||
+    data.employee?.id ||
+    null;
+
+  const employeeName = await resolveEmployeeName({
+    employeeId: adjustmentEmployeeId,
+    fallbackName:
+      data.employee_name ||
+      data.employee?.name ||
+      data.created_by_name,
+    fallbackEmail: data.employee?.email
+  });
 
   const adjustmentReason =
     data.reason ||
@@ -548,7 +663,8 @@ async function handleAdjustmentEvent(event) {
       const after =
         toNumber(line.post_stock_level) ??
         toNumber(line.in_stock_after) ??
-        toNumber(line.stock_after);
+        toNumber(line.stock_after) ??
+        toNumber(line.current_stock_level);
 
       const before =
         toNumber(line.pre_stock_level) ??
@@ -568,6 +684,7 @@ async function handleAdjustmentEvent(event) {
       registerRecentAdjustment({
         kind: 'adjustment',
         adjustmentId,
+        employeeId: adjustmentEmployeeId,
         employeeName,
         productName,
         storeId,
@@ -585,7 +702,7 @@ async function handleAdjustmentEvent(event) {
         title: '🛠️ Stock Adjustment',
         color: colorForDelta(delta, 0xF1C40F),
         actorLabel: 'Changed By',
-        actorName: employeeName,
+        actorName: formatActor(employeeName, adjustmentEmployeeId),
         productName,
         storeName,
         previousStock: before,
@@ -629,12 +746,21 @@ async function handleReceiptEvent(event) {
     storeNameCache.set(storeId, data.store_name);
   }
 
-  const cashierName =
-    data.cashier_name ||
-    data.employee_name ||
-    data.employee?.name ||
-    data.created_by_name ||
-    'Unknown';
+  const receiptEmployeeId =
+    data.employee_id ||
+    data.cashier_id ||
+    data.employee?.id ||
+    null;
+
+  const cashierName = await resolveEmployeeName({
+    employeeId: receiptEmployeeId,
+    fallbackName:
+      data.cashier_name ||
+      data.employee_name ||
+      data.employee?.name ||
+      data.created_by_name,
+    fallbackEmail: data.employee?.email
+  });
 
   const receiptNumber =
     data.receipt_number ||
@@ -688,6 +814,7 @@ async function handleReceiptEvent(event) {
       kind: 'sale',
       receiptId,
       receiptNumber,
+      employeeId: receiptEmployeeId,
       employeeName: cashierName,
       productName,
       storeId,
@@ -701,11 +828,15 @@ async function handleReceiptEvent(event) {
       createdAt
     });
 
+    if (storeId && variantId && after !== null) {
+      cancelPendingInventoryJob(storeId, variantId, after);
+    }
+
     const embed = buildMovementEmbed({
       title: isRefund ? '↩️ Refund' : '🛒 Sale',
       color: isRefund ? 0x2ECC71 : 0xE67E22,
       actorLabel: 'Cashier',
-      actorName: cashierName,
+      actorName: formatActor(cashierName, receiptEmployeeId),
       productName,
       storeName,
       previousStock,
@@ -881,6 +1012,8 @@ app.get('/health', (_req, res) => {
     ok: true,
     cachedVariants: variantNameCache.size,
     cachedStores: storeNameCache.size,
+    cachedEmployees: employeeCache.size,
+    employeeCacheAgeMs: employeesLoadedAt ? Date.now() - employeesLoadedAt : null,
     trackedStocks: stockSnapshots.size,
     recentAdjustmentBuckets: recentAdjustments.size,
     recentSaleBuckets: recentSales.size,
@@ -902,6 +1035,12 @@ app.post('/webhook', (req, res) => {
 async function start() {
   await loadSnapshots();
 
+  try {
+    await loadEmployees();
+  } catch (err) {
+    console.warn('Initial employee preload failed:', err.message);
+  }
+
   app.listen(PORT, () => {
     console.log(`Smart Bridge active on port ${PORT}`);
     console.log(`Quick update delay: ${QUICK_UPDATE_DELAY_MS}ms`);
@@ -909,6 +1048,7 @@ async function start() {
     console.log(`Receipt fetch delay: ${RECEIPT_FETCH_DELAY_MS}ms`);
     console.log(`Recent adjustment TTL: ${RECENT_ADJUSTMENT_TTL_MS}ms`);
     console.log(`Recent sale TTL: ${RECENT_SALE_TTL_MS}ms`);
+    console.log(`Employee cache TTL: ${EMPLOYEE_CACHE_TTL_MS}ms`);
   });
 }
 
