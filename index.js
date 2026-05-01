@@ -12,19 +12,18 @@ const {
   DISCORD_WEBHOOK_URL,
   LOYVERSE_ACCESS_TOKEN,
   PORT = 10000,
+
   QUICK_UPDATE_DELAY_MS = 3500,
   ADJUSTMENT_FETCH_DELAY_MS = 1500,
+  RECEIPT_FETCH_DELAY_MS = 1200,
+
   RECENT_ADJUSTMENT_TTL_MS = 90000,
+  RECENT_SALE_TTL_MS = 90000,
   EVENT_DEDUPE_TTL_MS = 10 * 60 * 1000
 } = process.env;
 
-if (!DISCORD_WEBHOOK_URL) {
-  throw new Error('Missing DISCORD_WEBHOOK_URL');
-}
-
-if (!LOYVERSE_ACCESS_TOKEN) {
-  throw new Error('Missing LOYVERSE_ACCESS_TOKEN');
-}
+if (!DISCORD_WEBHOOK_URL) throw new Error('Missing DISCORD_WEBHOOK_URL');
+if (!LOYVERSE_ACCESS_TOKEN) throw new Error('Missing LOYVERSE_ACCESS_TOKEN');
 
 const SNAPSHOT_FILE = path.join(__dirname, 'stock-snapshots.json');
 
@@ -33,25 +32,23 @@ const storeNameCache = new Map();
 const stockSnapshots = new Map();
 
 /**
- * Recent adjustment lines seen from real adjustment events.
- * Key: `${storeId}:${variantId}`
- * Value: Array<{
- *   adjustmentId, employeeName, productName, storeId, storeName,
- *   delta, before, after, reason, note, createdAt, expiresAt
- * }>
+ * Recent stock adjustments keyed by `${storeId}:${variantId}`
  */
 const recentAdjustments = new Map();
 
 /**
- * Pending timers for inventory_levels.update messages.
+ * Recent sales/receipts keyed by `${storeId}:${variantId}`
+ */
+const recentSales = new Map();
+
+/**
+ * Pending timers for inventory_levels.update
  * Key: `${storeId}:${variantId}:${currentStock}`
  */
 const pendingInventoryJobs = new Map();
 
 /**
- * Webhook dedupe memory to ignore retries / duplicates.
- * Key: fingerprint string
- * Value: expiresAt epoch ms
+ * Deduped webhook fingerprints
  */
 const processedEvents = new Map();
 
@@ -63,9 +60,7 @@ const loyverse = axios.create({
   }
 });
 
-const discord = axios.create({
-  timeout: 15000
-});
+const discord = axios.create({ timeout: 15000 });
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -73,6 +68,16 @@ function toNumber(value) {
   if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+function safeField(value, fallback = 'Unknown', max = 1024) {
+  const text = String(value ?? fallback).trim() || fallback;
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function safeText(value, fallback = 'Unknown', max = 2048) {
+  const text = String(value ?? fallback).trim() || fallback;
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
 function formatQty(value) {
@@ -83,16 +88,6 @@ function formatQty(value) {
 function formatDelta(value) {
   if (value === null || value === undefined) return 'Unknown';
   return value > 0 ? `+${value}` : String(value);
-}
-
-function safeField(value, fallback = 'Unknown') {
-  const text = String(value ?? fallback).trim() || fallback;
-  return text.length > 1024 ? `${text.slice(0, 1021)}...` : text;
-}
-
-function safeText(value, fallback = 'Unknown', max = 2048) {
-  const text = String(value ?? fallback).trim() || fallback;
-  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
 function stockKey(storeId, variantId) {
@@ -108,6 +103,17 @@ function parseTimeMs(value) {
   return Number.isFinite(ms) ? ms : Date.now();
 }
 
+function colorForDelta(delta, neutral = 0x95A5A6) {
+  if (delta === null || delta === undefined) return neutral;
+  if (delta < 0) return 0xE74C3C;
+  if (delta > 0) return 0x2ECC71;
+  return neutral;
+}
+
+function eventType(event) {
+  return String(event?.type || '').toLowerCase();
+}
+
 function cleanupProcessedEvents() {
   const now = Date.now();
   for (const [key, expiresAt] of processedEvents.entries()) {
@@ -115,20 +121,28 @@ function cleanupProcessedEvents() {
   }
 }
 
-function cleanupRecentAdjustments(key) {
+function cleanupExpiringEntries(map, key) {
   const now = Date.now();
 
   if (key) {
-    const current = recentAdjustments.get(key) || [];
+    const current = map.get(key) || [];
     const filtered = current.filter(entry => entry.expiresAt > now);
-    if (filtered.length > 0) recentAdjustments.set(key, filtered);
-    else recentAdjustments.delete(key);
+    if (filtered.length > 0) map.set(key, filtered);
+    else map.delete(key);
     return;
   }
 
-  for (const [k] of recentAdjustments.entries()) {
-    cleanupRecentAdjustments(k);
+  for (const existingKey of map.keys()) {
+    cleanupExpiringEntries(map, existingKey);
   }
+}
+
+function cleanupRecentAdjustments(key) {
+  cleanupExpiringEntries(recentAdjustments, key);
+}
+
+function cleanupRecentSales(key) {
+  cleanupExpiringEntries(recentSales, key);
 }
 
 function fingerprintEvent(event) {
@@ -150,7 +164,7 @@ function fingerprintEvent(event) {
   }
 
   const type = String(event.type || 'unknown');
-  const entityId = event.entity_id || event.adjustment_id || event.id || '';
+  const entityId = event.entity_id || event.adjustment_id || event.receipt_id || event.id || '';
   const hash = crypto
     .createHash('sha1')
     .update(JSON.stringify(event))
@@ -163,6 +177,7 @@ function fingerprintEvent(event) {
 function isDuplicateEvent(event) {
   cleanupProcessedEvents();
   const key = fingerprintEvent(event);
+
   if (processedEvents.has(key)) return true;
 
   processedEvents.set(key, Date.now() + Number(EVENT_DEDUPE_TTL_MS));
@@ -267,8 +282,7 @@ function getStoreDisplayName(storeId) {
 }
 
 function isAdjustmentEvent(event) {
-  const type = String(event?.type || '').toLowerCase();
-
+  const type = eventType(event);
   return (
     type.includes('adjustment') ||
     type.includes('inventory_adjustment') ||
@@ -276,8 +290,20 @@ function isAdjustmentEvent(event) {
   );
 }
 
+function isReceiptEvent(event) {
+  const type = eventType(event);
+  return (
+    type.startsWith('receipts.') ||
+    type.includes('receipt')
+  );
+}
+
 function getAdjustmentId(event) {
   return event?.entity_id || event?.adjustment_id || event?.id || null;
+}
+
+function getReceiptId(event) {
+  return event?.entity_id || event?.receipt_id || event?.id || null;
 }
 
 function registerRecentAdjustment(match) {
@@ -295,7 +321,22 @@ function registerRecentAdjustment(match) {
   recentAdjustments.set(key, list);
 }
 
-function consumeMatchingRecentAdjustment({
+function registerRecentSale(match) {
+  if (!match?.storeId || !match?.variantId) return;
+
+  const key = stockKey(match.storeId, match.variantId);
+  cleanupRecentSales(key);
+
+  const list = recentSales.get(key) || [];
+  list.push({
+    ...match,
+    expiresAt: Date.now() + Number(RECENT_SALE_TTL_MS)
+  });
+
+  recentSales.set(key, list);
+}
+
+function consumeMatchingEntry(container, ttlMs, {
   storeId,
   variantId,
   currentStock,
@@ -305,19 +346,17 @@ function consumeMatchingRecentAdjustment({
   if (!storeId || !variantId) return null;
 
   const key = stockKey(storeId, variantId);
-  cleanupRecentAdjustments(key);
+  cleanupExpiringEntries(container, key);
 
-  const list = recentAdjustments.get(key) || [];
+  const list = container.get(key) || [];
   if (list.length === 0) return null;
 
   const eventMs = parseTimeMs(eventTime);
-
   let bestIndex = -1;
   let bestScore = -Infinity;
 
   for (let i = 0; i < list.length; i++) {
     const entry = list[i];
-
     let score = 0;
 
     if (currentStock !== null && entry.after !== null) {
@@ -331,13 +370,26 @@ function consumeMatchingRecentAdjustment({
       entry.delta !== null &&
       previousStock + entry.delta === currentStock
     ) {
+      score += 6;
+    }
+
+    if (
+      previousStock !== null &&
+      currentStock !== null &&
+      entry.delta !== null &&
+      currentStock - previousStock === entry.delta
+    ) {
       score += 4;
+    }
+
+    if (previousStock !== null && entry.before !== null && previousStock === entry.before) {
+      score += 2;
     }
 
     const entryMs = parseTimeMs(entry.createdAt);
     const ageDiff = Math.abs(eventMs - entryMs);
 
-    if (ageDiff > Number(RECENT_ADJUSTMENT_TTL_MS)) continue;
+    if (ageDiff > Number(ttlMs)) continue;
 
     score += Math.max(0, 3 - Math.floor(ageDiff / 10000));
 
@@ -351,10 +403,18 @@ function consumeMatchingRecentAdjustment({
 
   const [match] = list.splice(bestIndex, 1);
 
-  if (list.length > 0) recentAdjustments.set(key, list);
-  else recentAdjustments.delete(key);
+  if (list.length > 0) container.set(key, list);
+  else container.delete(key);
 
   return match;
+}
+
+function consumeMatchingRecentAdjustment(payload) {
+  return consumeMatchingEntry(recentAdjustments, RECENT_ADJUSTMENT_TTL_MS, payload);
+}
+
+function consumeMatchingRecentSale(payload) {
+  return consumeMatchingEntry(recentSales, RECENT_SALE_TTL_MS, payload);
 }
 
 function cancelPendingInventoryJob(storeId, variantId, currentStock) {
@@ -365,6 +425,79 @@ function cancelPendingInventoryJob(storeId, variantId, currentStock) {
     clearTimeout(timer);
     pendingInventoryJobs.delete(key);
   }
+}
+
+function buildMovementEmbed({
+  title,
+  color,
+  actorLabel,
+  actorName,
+  productName,
+  storeName,
+  previousStock,
+  delta,
+  currentStock,
+  reason,
+  note,
+  footer,
+  timestamp
+}) {
+  const fields = [
+    {
+      name: 'Product',
+      value: safeField(productName),
+      inline: true
+    },
+    {
+      name: 'Store',
+      value: safeField(storeName),
+      inline: true
+    },
+    {
+      name: actorLabel,
+      value: safeField(actorName),
+      inline: true
+    },
+    {
+      name: 'Before',
+      value: safeField(formatQty(previousStock)),
+      inline: true
+    },
+    {
+      name: 'Change',
+      value: safeField(formatDelta(delta)),
+      inline: true
+    },
+    {
+      name: 'After',
+      value: safeField(formatQty(currentStock)),
+      inline: true
+    }
+  ];
+
+  if (reason) {
+    fields.push({
+      name: 'Reason',
+      value: safeField(reason),
+      inline: true
+    });
+  }
+
+  if (note) {
+    fields.push({
+      name: 'Note',
+      value: safeField(note),
+      inline: false
+    });
+  }
+
+  return {
+    title,
+    color,
+    fields,
+    footer: footer ? { text: safeText(footer) } : undefined,
+    timestamp
+  };
 }
 
 async function handleAdjustmentEvent(event) {
@@ -411,6 +544,7 @@ async function handleAdjustmentEvent(event) {
     for (const line of lineItems) {
       const variantId = line.variant_id || null;
       const delta = toNumber(line.stock_delta);
+
       const after =
         toNumber(line.post_stock_level) ??
         toNumber(line.in_stock_after) ??
@@ -432,6 +566,7 @@ async function handleAdjustmentEvent(event) {
       }
 
       registerRecentAdjustment({
+        kind: 'adjustment',
         adjustmentId,
         employeeName,
         productName,
@@ -446,67 +581,143 @@ async function handleAdjustmentEvent(event) {
         createdAt
       });
 
-      const fields = [
-        {
-          name: 'Changed By',
-          value: safeField(employeeName),
-          inline: true
-        },
-        {
-          name: 'Product',
-          value: safeField(productName),
-          inline: true
-        },
-        {
-          name: 'Store',
-          value: safeField(storeName),
-          inline: true
-        },
-        {
-          name: 'Previous Stock',
-          value: safeField(formatQty(before)),
-          inline: true
-        },
-        {
-          name: 'Change',
-          value: safeField(formatDelta(delta)),
-          inline: true
-        },
-        {
-          name: 'New Stock',
-          value: safeField(formatQty(after)),
-          inline: true
-        }
-      ];
-
-      if (adjustmentReason) {
-        fields.push({
-          name: 'Reason',
-          value: safeField(adjustmentReason),
-          inline: true
-        });
-      }
-
-      if (adjustmentNote) {
-        fields.push({
-          name: 'Note',
-          value: safeField(adjustmentNote),
-          inline: false
-        });
-      }
-
-      const embed = {
-        title: 'Stock Adjustment',
-        color: delta !== null && delta < 0 ? 0xE74C3C : 0x2ECC71,
-        fields,
-        footer: {
-          text: safeText(`Adjustment ID: ${adjustmentId}`)
-        },
+      const embed = buildMovementEmbed({
+        title: '🛠️ Stock Adjustment',
+        color: colorForDelta(delta, 0xF1C40F),
+        actorLabel: 'Changed By',
+        actorName: employeeName,
+        productName,
+        storeName,
+        previousStock: before,
+        delta,
+        currentStock: after,
+        reason: adjustmentReason || line.reason || null,
+        note: adjustmentNote || line.note || null,
+        footer: `Type: Adjustment • ID: ${adjustmentId}`,
         timestamp: createdAt
-      };
+      });
 
       await postToDiscord(embed);
     }
+  }
+}
+
+async function handleReceiptEvent(event) {
+  const receiptId = getReceiptId(event);
+  if (!receiptId) {
+    console.log('Receipt-like event without receipt id:', event?.type);
+    return;
+  }
+
+  await delay(Number(RECEIPT_FETCH_DELAY_MS));
+
+  const { data } = await loyverseGet(`/receipts/${receiptId}`);
+
+  const createdAt =
+    data.created_at ||
+    data.updated_at ||
+    event.created_at ||
+    new Date().toISOString();
+
+  const storeId = data.store_id || data.store?.id || null;
+  const storeName =
+    data.store_name ||
+    data.store?.name ||
+    getStoreDisplayName(storeId);
+
+  if (storeId && data.store_name) {
+    storeNameCache.set(storeId, data.store_name);
+  }
+
+  const cashierName =
+    data.cashier_name ||
+    data.employee_name ||
+    data.employee?.name ||
+    data.created_by_name ||
+    'Unknown';
+
+  const receiptNumber =
+    data.receipt_number ||
+    data.receipt_no ||
+    data.number ||
+    receiptId;
+
+  const receiptType = String(
+    data.receipt_type ||
+    data.type ||
+    ''
+  ).toLowerCase();
+
+  const isRefund =
+    Boolean(data.is_refund) ||
+    receiptType.includes('refund') ||
+    receiptType.includes('return');
+
+  const lineItems = Array.isArray(data.line_items)
+    ? data.line_items
+    : Array.isArray(data.items)
+      ? data.items
+      : [];
+
+  for (const line of lineItems) {
+    const variantId =
+      line.variant_id ||
+      line.variant?.id ||
+      null;
+
+    const quantity = Math.abs(
+      toNumber(line.quantity) ??
+      toNumber(line.qty) ??
+      toNumber(line.item_quantity) ??
+      0
+    );
+
+    if (!variantId || quantity === 0) continue;
+
+    const productName =
+      line.variant_name ||
+      line.item_name ||
+      line.item?.item_name ||
+      await getVariantDisplayName(variantId);
+
+    const delta = isRefund ? quantity : -quantity;
+    const previousStock = getPreviousSnapshot(storeId, variantId);
+    const after = previousStock !== null ? previousStock + delta : null;
+
+    registerRecentSale({
+      kind: 'sale',
+      receiptId,
+      receiptNumber,
+      employeeName: cashierName,
+      productName,
+      storeId,
+      storeName,
+      variantId,
+      delta,
+      before: previousStock,
+      after,
+      reason: isRefund ? 'Refund / return' : 'Sale',
+      note: null,
+      createdAt
+    });
+
+    const embed = buildMovementEmbed({
+      title: isRefund ? '↩️ Refund' : '🛒 Sale',
+      color: isRefund ? 0x2ECC71 : 0xE67E22,
+      actorLabel: 'Cashier',
+      actorName: cashierName,
+      productName,
+      storeName,
+      previousStock,
+      delta,
+      currentStock: after,
+      reason: isRefund ? 'Refund / return' : 'Sale',
+      note: null,
+      footer: `Type: ${isRefund ? 'Refund' : 'Sale'} • Receipt: ${receiptNumber}`,
+      timestamp: createdAt
+    });
+
+    await postToDiscord(embed);
   }
 }
 
@@ -521,28 +732,54 @@ async function finalizeInventoryLevelUpdate(level, event) {
     delta = currentStock - previousStock;
   }
 
+  const eventTime = event.created_at || level.updated_at || new Date().toISOString();
+
   const matchedAdjustment = consumeMatchingRecentAdjustment({
     storeId,
     variantId,
     currentStock,
     previousStock,
-    eventTime: event.created_at || level.updated_at || new Date().toISOString()
+    eventTime
   });
+
+  if (matchedAdjustment) {
+    if (currentStock !== null && storeId && variantId) {
+      rememberSnapshot(storeId, variantId, currentStock);
+    }
+
+    console.log(
+      `Suppressed inventory_levels.update for ${storeId}/${variantId} ` +
+      `because it matched adjustment ${matchedAdjustment.adjustmentId}`
+    );
+    return;
+  }
+
+  const matchedSale = consumeMatchingRecentSale({
+    storeId,
+    variantId,
+    currentStock,
+    previousStock,
+    eventTime
+  });
+
+  if (matchedSale) {
+    if (currentStock !== null && storeId && variantId) {
+      rememberSnapshot(storeId, variantId, currentStock);
+    }
+
+    console.log(
+      `Suppressed inventory_levels.update for ${storeId}/${variantId} ` +
+      `because it matched receipt ${matchedSale.receiptId}`
+    );
+    return;
+  }
 
   if (currentStock !== null && storeId && variantId) {
     rememberSnapshot(storeId, variantId, currentStock);
   }
 
-  /**
-   * If we could match this quick update to a real recent adjustment,
-   * skip the Discord post because the richer adjustment message was
-   * already sent (or is the source of truth).
-   */
-  if (matchedAdjustment) {
-    console.log(
-      `Suppressed duplicate quick update for ${storeId}/${variantId} ` +
-      `because it matched adjustment ${matchedAdjustment.adjustmentId}`
-    );
+  if (previousStock !== null && currentStock !== null && previousStock === currentStock) {
+    console.log(`Ignored no-op inventory update for ${storeId}/${variantId}`);
     return;
   }
 
@@ -552,50 +789,21 @@ async function finalizeInventoryLevelUpdate(level, event) {
 
   const storeName = getStoreDisplayName(storeId);
 
-  const embed = {
-    title: 'Quick Stock Update',
-    color: 0x3498DB,
-    fields: [
-      {
-        name: 'Changed By',
-        value: 'Unknown (inventory_levels.update does not include employee info)',
-        inline: false
-      },
-      {
-        name: 'Product',
-        value: safeField(productName),
-        inline: true
-      },
-      {
-        name: 'Store',
-        value: safeField(storeName),
-        inline: true
-      },
-      {
-        name: 'Previous Stock',
-        value: previousStock === null
-          ? 'Unknown (first seen or server restarted)'
-          : safeField(formatQty(previousStock)),
-        inline: true
-      },
-      {
-        name: 'Change',
-        value: safeField(formatDelta(delta)),
-        inline: true
-      },
-      {
-        name: 'New Stock',
-        value: safeField(formatQty(currentStock)),
-        inline: true
-      }
-    ],
-    footer: {
-      text: safeText(
-        'Fast webhook only. Exact employee requires a matching stock adjustment or your own audit trail.'
-      )
-    },
-    timestamp: event.created_at || level.updated_at || new Date().toISOString()
-  };
+  const embed = buildMovementEmbed({
+    title: '✍️ Manual Stock Change',
+    color: colorForDelta(delta, 0x3498DB),
+    actorLabel: 'Changed By',
+    actorName: 'Unknown',
+    productName,
+    storeName,
+    previousStock: previousStock === null ? 'Unknown (first seen / restarted)' : previousStock,
+    delta,
+    currentStock,
+    reason: 'No matching receipt or adjustment found',
+    note: 'Detected from inventory_levels.update only',
+    footer: 'Type: Manual change • Source: inventory_levels.update',
+    timestamp: eventTime
+  });
 
   await postToDiscord(embed);
 }
@@ -645,6 +853,11 @@ async function processWebhook(event) {
       return;
     }
 
+    if (isReceiptEvent(event)) {
+      await handleReceiptEvent(event);
+      return;
+    }
+
     if (event?.type === 'inventory_levels.update') {
       await handleInventoryLevelsUpdate(event);
       return;
@@ -662,6 +875,7 @@ async function processWebhook(event) {
 app.get('/health', (_req, res) => {
   cleanupProcessedEvents();
   cleanupRecentAdjustments();
+  cleanupRecentSales();
 
   res.status(200).json({
     ok: true,
@@ -669,6 +883,7 @@ app.get('/health', (_req, res) => {
     cachedStores: storeNameCache.size,
     trackedStocks: stockSnapshots.size,
     recentAdjustmentBuckets: recentAdjustments.size,
+    recentSaleBuckets: recentSales.size,
     pendingInventoryJobs: pendingInventoryJobs.size,
     processedWebhookFingerprints: processedEvents.size
   });
@@ -678,7 +893,7 @@ app.post('/webhook', (req, res) => {
   const event = req.body;
 
   // Optional hardening:
-  // Validate Loyverse signature/header here before trusting the payload.
+  // Validate Loyverse signature/header here before trusting payload.
 
   res.status(200).send('OK');
   void processWebhook(event);
@@ -691,7 +906,9 @@ async function start() {
     console.log(`Smart Bridge active on port ${PORT}`);
     console.log(`Quick update delay: ${QUICK_UPDATE_DELAY_MS}ms`);
     console.log(`Adjustment fetch delay: ${ADJUSTMENT_FETCH_DELAY_MS}ms`);
+    console.log(`Receipt fetch delay: ${RECEIPT_FETCH_DELAY_MS}ms`);
     console.log(`Recent adjustment TTL: ${RECENT_ADJUSTMENT_TTL_MS}ms`);
+    console.log(`Recent sale TTL: ${RECENT_SALE_TTL_MS}ms`);
   });
 }
 
